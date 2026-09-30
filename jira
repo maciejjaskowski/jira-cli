@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+# jira - small JIRA CLI.
+#
+# Subcommands:
+#   jira news     Lists my JIRA tasks (open, or in current sprint) as an Obsidian-pastable markdown table.
+#   jira verify   For JIRA_EMAIL, flags sprint/estimate hygiene issues and reports sprint hour totals.
+#   jira sprint   Prints the current and future sprints of JIRA_BOARD_ID.
+#   jira burndown `jira burndown [--user EMAIL] [--sprint SPRINT_ID]` prints an ASCII burndown
+#                 chart (hours) for a user's issues in a sprint. Omit --sprint to pick from active
+#                 sprints via fzf; omit --user to default to JIRA_EMAIL.
+#   jira release  Lists unreleased versions (and the last released one) of JIRA_PROJECT, or `jira release <PROJECT>`.
+#   jira update   `jira update TASK_ID STATUS` transitions an issue. STATUS is one of:
+#                 todo, inprogress, review, done, closed.
+#
+# Required env vars (set them in a non-tracked file, e.g. ~/.zshrc.local):
+#   JIRA_BASE_URL    e.g. https://your-org.atlassian.net
+#   JIRA_EMAIL       your Atlassian login email
+#   JIRA_API_TOKEN   https://id.atlassian.com/manage-profile/security/api-tokens
+#   JIRA_BOARD_ID    the Agile board id to inspect (required by `jira sprint` and `jira verify`).
+#                    Find it via: GET $JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>
+# Required by `jira update` (transition IDs; find via GET $API/issue/<KEY>/transitions):
+#   JIRA_TRANSITION_TODO        e.g. 51 (To Do)
+#   JIRA_TRANSITION_INPROGRESS  e.g. 31 (In Progress)
+#   JIRA_TRANSITION_REVIEW      e.g. 3  (In Review)
+#   JIRA_TRANSITION_DONE        e.g. 41 (Done)
+#   JIRA_TRANSITION_CLOSED      e.g. 41 (Closed, if distinct from Done on your workflow)
+# Optional:
+#   JIRA_ACCOUNT_ID  your Atlassian accountId (required by `jira news`)
+#   JIRA_SPRINT_FIELD  Jira custom field id holding sprints (default customfield_10018; differs per instance)
+#   JIRA_PROJECT     default project key for `jira release` (e.g. PROJ); can be overridden with `jira release <PROJECT>`
+#   JIRA_VERIFY_SINCE_DAYS  how far back `jira verify` looks for non-Done issues (default 90)
+#   JIRA_VERIFY_DONE_DAYS   how far back `jira verify` looks for Done/Closed issues, measured from when they entered Done (default 14)
+
+set -euo pipefail
+
+: "${JIRA_BASE_URL:?Set JIRA_BASE_URL (e.g. https://your-org.atlassian.net)}"
+: "${JIRA_EMAIL:?Set JIRA_EMAIL}"
+: "${JIRA_API_TOKEN:?Set JIRA_API_TOKEN}"
+JIRA_ACCOUNT_ID="${JIRA_ACCOUNT_ID:-}"   # required by `jira news` only
+JIRA_SPRINT_FIELD="${JIRA_SPRINT_FIELD:-customfield_10018}"
+
+command -v jq >/dev/null || { echo "jq required" >&2; exit 1; }
+
+AUTH="${JIRA_EMAIL}:${JIRA_API_TOKEN}"
+API="${JIRA_BASE_URL%/}/rest/api/3"
+AGILE_API="${JIRA_BASE_URL%/}/rest/agile/1.0"
+
+api_get() {
+  local out curl_exit http_code body
+  set +e
+  out=$(curl -s -w '\n%{http_code}' -u "$AUTH" -H "Accept: application/json" "$@")
+  curl_exit=$?
+  set -e
+
+  if [ $curl_exit -ne 0 ]; then
+    echo "curl failed (exit $curl_exit) calling: $API..." >&2
+    case $curl_exit in
+      56) echo "  = failed receiving data. Usually corporate proxy/VPN/TLS interception. Try: check VPN, or set https_proxy/HTTPS_PROXY env, or curl -v to same URL to see where it dies." >&2 ;;
+      6)  echo "  = could not resolve host. Check JIRA_BASE_URL." >&2 ;;
+      28) echo "  = timeout. Check network/VPN." >&2 ;;
+      60) echo "  = SSL cert problem. Corporate proxy doing TLS inspection? Check its CA cert is trusted." >&2 ;;
+    esac
+    exit 1
+  fi
+
+  http_code=$(echo "$out" | tail -n1)
+  body=$(echo "$out" | sed '$d')
+
+  if [ "$http_code" -ge 400 ]; then
+    echo "JIRA API returned HTTP $http_code" >&2
+    echo "$body" | jq . >&2 2>/dev/null || echo "$body" >&2
+    case $http_code in
+      401) echo "  = JIRA_API_TOKEN is missing, wrong, or expired." >&2
+           echo "  1. Generate a new token: https://id.atlassian.com/manage-profile/security/api-tokens" >&2
+           echo "  2. Update JIRA_API_TOKEN in ~/.zshrc.local" >&2
+           echo "  3. Run: source ~/.zshrc.local && jira news" >&2 ;;
+      403) echo "  = no permission, or hit CAPTCHA lockout (too many bad auth attempts) - login via browser once." >&2 ;;
+    esac
+    exit 1
+  fi
+
+  echo "$body"
+}
+
+# POST JSON to a JIRA endpoint. Usage: api_post <url> <json-body>
+api_post() {
+  local url="$1" json="$2"
+  local out curl_exit http_code body
+  set +e
+  out=$(curl -s -w '\n%{http_code}' -u "$AUTH" -X POST \
+    -H "Accept: application/json" -H "Content-Type: application/json" \
+    --data "$json" "$url")
+  curl_exit=$?
+  set -e
+
+  if [ $curl_exit -ne 0 ]; then
+    echo "curl failed (exit $curl_exit) calling: $url" >&2
+    exit 1
+  fi
+
+  http_code=$(echo "$out" | tail -n1)
+  body=$(echo "$out" | sed '$d')
+
+  if [ "$http_code" -ge 400 ]; then
+    echo "JIRA API returned HTTP $http_code" >&2
+    echo "$body" | jq . >&2 2>/dev/null || echo "$body" >&2
+    exit 1
+  fi
+
+  echo "$body"
+}
+
+# Verify auth explicitly: /search/jql can silently return 0 issues on an
+# expired/invalid token instead of a 401, which used to look like "no work to do".
+verify_auth() {
+  api_get "$API/myself" >/dev/null
+}
+
+# Fetch all issue keys matching a JQL, via cursor-based pagination.
+fetch_keys() {
+  local jql="$1" fields="$2"
+  local -a args
+  local keys=() next_token="" page_size=100 resp count is_last
+
+  while :; do
+    args=(-G "$API/search/jql" \
+      --data-urlencode "jql=$jql" \
+      --data-urlencode "fields=$fields" \
+      --data-urlencode "maxResults=$page_size")
+    [ -n "$next_token" ] && args+=(--data-urlencode "nextPageToken=$next_token")
+
+    resp=$(api_get "${args[@]}")
+    count=$(echo "$resp" | jq '.issues | length')
+    [ "$count" -eq 0 ] && break
+    while IFS= read -r line; do keys+=("$line"); done < <(echo "$resp" | jq -r '.issues[].key')
+
+    is_last=$(echo "$resp" | jq -r '.isLast // true')
+    [ "$is_last" = "true" ] && break
+    next_token=$(echo "$resp" | jq -r '.nextPageToken // empty')
+    [ -z "$next_token" ] && break
+  done
+
+  printf '%s\n' "${keys[@]}"
+}
+
+# Fetch all sprints of a board in a given state (active|future|closed), via offset pagination.
+fetch_board_sprints() {
+  local board_id="$1" state="$2"
+  local all="[]" start_at=0 page_size=50 resp values is_last
+
+  while :; do
+    resp=$(api_get -G "$AGILE_API/board/$board_id/sprint" \
+      --data-urlencode "state=$state" \
+      --data-urlencode "startAt=$start_at" \
+      --data-urlencode "maxResults=$page_size")
+    values=$(echo "$resp" | jq -c '.values')
+    all=$(jq -c -n --argjson a "$all" --argjson b "$values" '$a + $b')
+    is_last=$(echo "$resp" | jq -r '.isLast // true')
+    [ "$is_last" = "true" ] && break
+    start_at=$((start_at + page_size))
+  done
+
+  echo "$all"
+}
+
+cmd_news() {
+  : "${JIRA_ACCOUNT_ID:?Set JIRA_ACCOUNT_ID for jira news}"
+  verify_auth
+
+  local jql='assignee = currentUser() AND (statusCategory != Done OR sprint in openSprints()) ORDER BY updated DESC'
+  local keys=()
+  while IFS= read -r line; do [ -n "$line" ] && keys+=("$line"); done < <(fetch_keys "$jql" "summary,status,${JIRA_SPRINT_FIELD}")
+
+  if [ "${#keys[@]}" -eq 0 ]; then
+    echo "No issues found." >&2
+    exit 0
+  fi
+
+  local rows="[]"
+
+  for key in "${keys[@]}"; do
+    issue=$(api_get "$API/issue/$key?fields=summary,status,${JIRA_SPRINT_FIELD},comment,issuelinks&expand=changelog")
+
+    summary=$(echo "$issue" | jq -r '.fields.summary')
+    status=$(echo "$issue" | jq -r '.fields.status.name')
+    sprint=$(echo "$issue" | jq -r --arg sf "$JIRA_SPRINT_FIELD" '
+      (.fields[$sf] // []) as $sprints
+      | ($sprints | map(select(.state == "active"))) as $active
+      | if ($active | length) > 0 then $active[0].name
+        else ($sprints[-1].name // "")
+        end
+    ')
+
+    # "Parent-Child" issue link type (id 10206): outwardIssue = "is parent of" us, inwardIssue = a child of us.
+    parent=$(echo "$issue" | jq -r '
+      [.fields.issuelinks[]? | select(.type.id == "10206") | .outwardIssue.key] | first // ""
+    ')
+
+    last_change=$(echo "$issue" | jq -r --arg me "$JIRA_ACCOUNT_ID" '
+      ([.changelog.histories[]?
+        | select(.author.accountId != $me)
+        | select(any(.items[]?; .field == "description"))
+        | .created
+       ]
+       +
+       [.fields.comment.comments[]?
+        | select(.author.accountId != $me)
+        | (.updated // .created)
+       ])
+      | sort | last // ""
+    ')
+
+    rows=$(echo "$rows" | jq --arg key "$key" --arg status "$status" --arg sprint "$sprint" \
+      --arg summary "$summary" --arg last "$last_change" --arg base "$JIRA_BASE_URL" --arg parent "$parent" \
+      '. + [{key:$key, status:$status, sprint:$sprint, summary:$summary, last:$last, base:$base, parent:$parent}]')
+  done
+
+  # Sort: status group first (Done, In Review, In Progress, To Do, other), then newest last_change within group
+  local status_rank='{"Done":0,"In Review":1,"In Progress":2,"To Do":3}'
+  local sorted
+  sorted=$(echo "$rows" | jq --argjson rank "$status_rank" '
+    map(. + {_rank: ($rank[.status] // 4)})
+    | group_by(._rank)
+    | sort_by(.[0]._rank)
+    | map(sort_by(.last) | reverse)
+    | flatten
+    | map(del(._rank))
+  ')
+
+  esc() { printf '%s' "$1" | sed 's/|/\\|/g'; }
+
+  print_row() {
+    local row="$1" depth="$2" key base status sprint summary last indent parent_note
+    key=$(echo "$row" | jq -r '.key')
+    base=$(echo "$row" | jq -r '.base')
+    status=$(echo "$row" | jq -r '.status')
+    sprint=$(echo "$row" | jq -r '.sprint')
+    summary=$(echo "$row" | jq -r '.summary')
+    last=$(echo "$row" | jq -r '.last')
+    parent=$(echo "$row" | jq -r '.parent')
+    [ -n "$last" ] && last=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${last:0:19}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last")
+    indent=$(printf '%*s' $((depth * 2)) '')
+    parent_note=""
+    if [ "$depth" -eq 0 ] && [ -n "$parent" ]; then
+      parent_note=" _(parent: [$parent]($base/browse/$parent), not in this list)_"
+    fi
+    printf "%s- [%s](%s/browse/%s) — %s | %s | %s | %s%s\n" \
+      "$indent" "$key" "$base" "$key" "$(esc "$status")" "$(esc "$sprint")" "$(esc "$summary")" "$last" "$parent_note"
+  }
+
+  # Recursively print a node and its children (children = rows whose .parent == this key).
+  print_tree() {
+    local key="$1" depth="$2"
+    visited="$visited $key"
+    local row
+    row=$(echo "$sorted" | jq -c --arg k "$key" '.[] | select(.key == $k)')
+    print_row "$row" "$depth"
+    local children
+    children=$(echo "$sorted" | jq -r --arg k "$key" '[.[] | select(.parent == $k) | .key] | .[]')
+    local child
+    while IFS= read -r child; do
+      [ -z "$child" ] && continue
+      print_tree "$child" $((depth + 1))
+    done <<< "$children"
+  }
+
+  # Roots: issues whose parent is empty, or whose parent isn't among the fetched issues.
+  local roots
+  roots=$(echo "$sorted" | jq -r --argjson present "$(echo "$sorted" | jq '[.[].key]')" '
+    [.[] | select((.parent == "") or ((.parent as $p | $present | index($p)) | not)) | .key] | .[]
+  ')
+
+  visited=""
+  while IFS= read -r root; do
+    [ -z "$root" ] && continue
+    print_tree "$root" 0
+  done <<< "$roots"
+}
+
+# Resolve JIRA_EMAIL to an accountId.
+resolve_user_account_id() {
+  local user="$1"
+  if [[ "$user" == *:* ]]; then
+    # Already looks like an accountId (contains a colon, e.g. "712020:uuid").
+    echo "$user"
+    return
+  fi
+  local resp account_id
+  resp=$(api_get -G "$API/user/search" --data-urlencode "query=$user")
+  account_id=$(echo "$resp" | jq -r '.[0].accountId // empty')
+  if [ -z "$account_id" ]; then
+    echo "Could not resolve JIRA_EMAIL='$user' to an accountId via $API/user/search" >&2
+    exit 1
+  fi
+  echo "$account_id"
+}
+
+cmd_verify() {
+  : "${JIRA_BOARD_ID:?Set JIRA_BOARD_ID (see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>)}"
+  verify_auth
+
+  local account_id display_name
+  account_id=$(resolve_user_account_id "$JIRA_EMAIL")
+
+  local since_days="${JIRA_VERIFY_SINCE_DAYS:-90}"
+  local done_days="${JIRA_VERIFY_DONE_DAYS:-14}"
+  local jql="assignee = \"$account_id\" AND ((statusCategory != Done AND updated >= -${since_days}d) OR (statusCategory = Done AND statusCategoryChangedDate >= -${done_days}d)) ORDER BY updated DESC"
+  local keys=()
+  while IFS= read -r line; do [ -n "$line" ] && keys+=("$line"); done < <(fetch_keys "$jql" "summary,status,${JIRA_SPRINT_FIELD},timeoriginalestimate")
+
+  if [ "${#keys[@]}" -eq 0 ]; then
+    echo "No issues found for JIRA_EMAIL='$JIRA_EMAIL' (accountId=$account_id)." >&2
+    exit 0
+  fi
+
+  local issues="[]"
+  for key in "${keys[@]}"; do
+    issue=$(api_get "$API/issue/$key?fields=summary,status,${JIRA_SPRINT_FIELD},timeoriginalestimate")
+    issues=$(echo "$issues" | jq --arg key "$key" --arg base "$JIRA_BASE_URL" --arg sf "$JIRA_SPRINT_FIELD" --argjson issue "$issue" '. + [{
+      key: $key,
+      base: $base,
+      summary: $issue.fields.summary,
+      status: $issue.fields.status.name,
+      estimate_seconds: $issue.fields.timeoriginalestimate,
+      sprints: ($issue.fields[$sf] // [])
+    }]')
+  done
+
+  display_name=$(api_get -G "$API/user" --data-urlencode "accountId=$account_id" | jq -r '.displayName // "'"$JIRA_EMAIL"'"')
+
+  echo "=== jira verify: $display_name ($account_id) ==="
+  echo
+
+  # 1. In progress / in review / done, but not in any sprint.
+  echo "-- In progress/review/done with NO sprint --"
+  local no_sprint
+  no_sprint=$(echo "$issues" | jq -r '
+    [.[] | select(.status == "In Progress" or .status == "In Review" or .status == "Done")
+         | select((.sprints // []) | length == 0)]
+    | .[] | "- [\(.key)](\(.base)/browse/\(.key)) — \(.status) | \(.summary)"
+  ')
+  if [ -z "$no_sprint" ]; then
+    echo "(none)"
+  else
+    echo "$no_sprint"
+  fi
+  echo
+
+  # 2. Assigned but no hour estimate.
+  echo "-- Assigned, in current sprint, with NO hour estimate --"
+  local no_estimate
+  no_estimate=$(echo "$issues" | jq -r '
+    [.[] | select(.estimate_seconds == null) | select((.sprints // []) | any(.state == "active"))]
+    | .[] | "- [\(.key)](\(.base)/browse/\(.key)) — \(.status) | \(.summary)"
+  ')
+  if [ -z "$no_estimate" ]; then
+    echo "(none)"
+  else
+    echo "$no_estimate"
+  fi
+  echo
+
+  # 3. Current and previous sprint hour totals (sprint identity comes from the board, not from
+  # whichever sprints happen to be attached to this user's own issues).
+  echo "-- Sprint hour estimates --"
+  local active_sprints closed_sprints
+  active_sprints=$(fetch_board_sprints "$JIRA_BOARD_ID" "active")
+  closed_sprints=$(fetch_board_sprints "$JIRA_BOARD_ID" "closed" | jq -c 'sort_by(.endDate // "") | reverse')
+
+  if [ "$(echo "$active_sprints" | jq 'length')" -eq 0 ]; then
+    echo "Current sprint: none found."
+  else
+    echo "$active_sprints" | jq -c '.[]' | while IFS= read -r sprint; do
+      local sid sname hours
+      sid=$(echo "$sprint" | jq -r '.id')
+      sname=$(echo "$sprint" | jq -r '.name')
+      hours=$(echo "$issues" | jq --argjson sid "$sid" '
+        [.[] | select((.sprints // []) | any(.id == $sid)) | (.estimate_seconds // 0)] | add / 3600
+      ')
+      echo "Current sprint \"$sname\": ${hours}h estimated"
+      echo "$issues" | jq -r --argjson sid "$sid" --arg pp "${JIRA_PROJECT:-}-" '
+        [.[] | select((.sprints // []) | any(.id == $sid)) | select(.key | startswith($pp)) | select(.estimate_seconds != null)]
+        | sort_by(.key)
+        | .[] | "  - \(.key): \(.estimate_seconds / 3600)h — \(.summary)"
+      '
+    done
+  fi
+
+  if [ "$(echo "$closed_sprints" | jq 'length')" -eq 0 ]; then
+    echo "Previous sprint: none found."
+  else
+    local prev_sprint psid psname phours
+    prev_sprint=$(echo "$closed_sprints" | jq -c '.[0]')
+    psid=$(echo "$prev_sprint" | jq -r '.id')
+    psname=$(echo "$prev_sprint" | jq -r '.name')
+    phours=$(echo "$issues" | jq --argjson sid "$psid" '
+      [.[] | select((.sprints // []) | any(.id == $sid)) | (.estimate_seconds // 0)] | add / 3600
+    ')
+    echo "Previous sprint \"$psname\": ${phours}h estimated"
+  fi
+  echo
+
+  # 4. No task in progress.
+  local in_progress_count
+  in_progress_count=$(echo "$issues" | jq '[.[] | select(.status == "In Progress")] | length')
+  if [ "$in_progress_count" -eq 0 ]; then
+    echo "⚠ No task is currently In Progress for $display_name."
+  else
+    echo "OK: $in_progress_count task(s) In Progress."
+  fi
+}
+
+cmd_sprint() {
+  : "${JIRA_BOARD_ID:?Set JIRA_BOARD_ID (see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>)}"
+  verify_auth
+
+  local active future
+
+  fmt_sprints() {
+    jq -r '.[] | "  - \(.name) (id \(.id), \((.startDate // "?")[0:10]) → \((.endDate // "?")[0:10]))"'
+  }
+
+  active=$(fetch_board_sprints "$JIRA_BOARD_ID" "active")
+  echo "Current:"
+  if [ "$(echo "$active" | jq 'length')" -eq 0 ]; then
+    echo "  none (board is between sprints)"
+  else
+    echo "$active" | fmt_sprints
+  fi
+
+  future=$(fetch_board_sprints "$JIRA_BOARD_ID" "future" | jq -c 'sort_by(.startDate // "")')
+  echo "Future:"
+  if [ "$(echo "$future" | jq 'length')" -eq 0 ]; then
+    echo "  none"
+  else
+    echo "$future" | fmt_sprints
+  fi
+}
+
+cmd_burndown() {
+  : "${JIRA_BOARD_ID:?Set JIRA_BOARD_ID (see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>)}"
+  verify_auth
+
+  local user="$JIRA_EMAIL" sprint_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user) user="${2:?--user requires a value}"; shift 2 ;;
+      --sprint) sprint_id="${2:?--sprint requires a value}"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; echo "Usage: jira burndown [--user EMAIL] [--sprint SPRINT_ID]" >&2; exit 1 ;;
+    esac
+  done
+
+  local account_id display_name
+  account_id=$(resolve_user_account_id "$user")
+  display_name=$(api_get -G "$API/user" --data-urlencode "accountId=$account_id" | jq -r --arg u "$user" '.displayName // $u')
+
+  if [ -z "$sprint_id" ]; then
+    local active
+    active=$(fetch_board_sprints "$JIRA_BOARD_ID" "active")
+    if [ "$(echo "$active" | jq 'length')" -eq 0 ]; then
+      echo "No active sprints found on board $JIRA_BOARD_ID. Pass --sprint SPRINT_ID for a closed sprint." >&2
+      exit 1
+    fi
+    command -v fzf >/dev/null || { echo "fzf is required to pick a sprint (or pass --sprint SPRINT_ID explicitly)." >&2; exit 1; }
+    [ -t 0 ] && [ -t 1 ] || { echo "Not running in a terminal; pass --sprint SPRINT_ID explicitly." >&2; exit 1; }
+
+    local picked
+    picked=$(echo "$active" | jq -r '.[] | "\(.id)\t\(.name) (\((.startDate // "?")[0:10]) → \((.endDate // "?")[0:10]))"' \
+      | fzf --with-nth=2 --delimiter='\t' --prompt="Sprint> ")
+    [ -z "$picked" ] && { echo "No sprint selected." >&2; exit 1; }
+    sprint_id=$(printf '%s' "$picked" | cut -f1)
+  fi
+
+  local sprint sprint_name sprint_state sprint_start sprint_end
+  sprint=$(api_get "$AGILE_API/sprint/$sprint_id")
+  sprint_name=$(echo "$sprint" | jq -r '.name')
+  sprint_state=$(echo "$sprint" | jq -r '.state')
+  sprint_start=$(echo "$sprint" | jq -r '(.startDate // empty)[0:10]')
+  sprint_end=$(echo "$sprint" | jq -r '(.endDate // empty)[0:10]')
+
+  if [ -z "$sprint_start" ] || [ -z "$sprint_end" ]; then
+    echo "Sprint $sprint_id has no start/end date set; cannot draw a burndown." >&2
+    exit 1
+  fi
+
+  local jql="assignee = \"$account_id\" AND sprint = $sprint_id"
+  local keys=()
+  while IFS= read -r line; do [ -n "$line" ] && keys+=("$line"); done < <(fetch_keys "$jql" "summary,status,timeoriginalestimate")
+
+  if [ "${#keys[@]}" -eq 0 ]; then
+    echo "No issues assigned to $display_name in sprint \"$sprint_name\"." >&2
+    exit 0
+  fi
+
+  local issues="[]" issue summary status hours done_date
+  for key in "${keys[@]}"; do
+    issue=$(api_get "$API/issue/$key?fields=summary,status,timeoriginalestimate&expand=changelog")
+    summary=$(echo "$issue" | jq -r '.fields.summary')
+    status=$(echo "$issue" | jq -r '.fields.status.name')
+    hours=$(echo "$issue" | jq -r '(.fields.timeoriginalestimate // 0) / 3600')
+
+    # Last time this issue's status changed to Done/Closed.
+    done_date=$(echo "$issue" | jq -r '
+      [.changelog.histories[]?
+        | select(any(.items[]?; .field == "status" and (.toString == "Done" or .toString == "Closed")))
+        | .created]
+      | sort | last // empty
+    ' | cut -c1-10)
+    # Only counts as burned down if the issue is *currently* Done/Closed (not reopened since).
+    if [ "$status" != "Done" ] && [ "$status" != "Closed" ]; then
+      done_date=""
+    fi
+
+    issues=$(echo "$issues" | jq --arg key "$key" --arg summary "$summary" --arg status "$status" \
+      --argjson hours "$hours" --arg done_date "$done_date" \
+      '. + [{key:$key, summary:$summary, status:$status, hours:$hours, done_date:$done_date}]')
+  done
+
+  local total_hours
+  total_hours=$(echo "$issues" | jq '[.[].hours] | add')
+
+  # The x-axis always spans the full sprint (start to end date), so the end date is visible
+  # even mid-sprint. The "actual" line only has real data through today for an active sprint
+  # (or through the end date once the sprint is closed) - later days get a null actual.
+  local today last_actual_day
+  today=$(date +%Y-%m-%d)
+  if [ "$sprint_state" = "active" ] && [[ "$today" < "$sprint_end" ]]; then
+    last_actual_day="$today"
+  else
+    last_actual_day="$sprint_end"
+  fi
+
+  local dates=() d
+  d="$sprint_start"
+  while [[ "$d" < "$sprint_end" || "$d" == "$sprint_end" ]]; do
+    dates+=("$d")
+    d=$(date -j -v+1d -f "%Y-%m-%d" "$d" "+%Y-%m-%d")
+  done
+
+  # Total working days (Mon-Fri) across the whole sprint, for the ideal line's slope.
+  local total_wdays=0 wd
+  d="$sprint_start"
+  while [[ "$d" < "$sprint_end" || "$d" == "$sprint_end" ]]; do
+    wd=$(date -j -f "%Y-%m-%d" "$d" "+%u")
+    [ "$wd" -le 5 ] && total_wdays=$((total_wdays + 1))
+    d=$(date -j -v+1d -f "%Y-%m-%d" "$d" "+%Y-%m-%d")
+  done
+  [ "$total_wdays" -eq 0 ] && total_wdays=1
+
+  # Seed with a virtual "start" point at 100% (before day 1's work happens), so each
+  # real date below can show its *end-of-day* value - day 1 then correctly drops from
+  # 100% to ~90% instead of the chart opening already one workday burned down.
+  local series
+  series=$(jq -n --argjson t "$total_hours" '[{date:"start", label:"start", ideal:$t, actual:$t}]')
+
+  local wdays_elapsed=0 ideal actual label
+  for d in "${dates[@]}"; do
+    wd=$(date -j -f "%Y-%m-%d" "$d" "+%u")
+    [ "$wd" -le 5 ] && wdays_elapsed=$((wdays_elapsed + 1))
+    ideal=$(awk -v t="$total_hours" -v e="$wdays_elapsed" -v n="$total_wdays" 'BEGIN{printf "%.2f", t * (1 - e/n)}')
+    label="${d:5}"
+    if [[ "$d" > "$last_actual_day" ]]; then
+      series=$(echo "$series" | jq --arg d "$d" --arg label "$label" --argjson ideal "$ideal" '. + [{date:$d, label:$label, ideal:$ideal, actual:null}]')
+      continue
+    fi
+    actual=$(echo "$issues" | jq --arg d "$d" '[.[] | select(.done_date != "" and .done_date <= $d) | .hours] | add // 0')
+    actual=$(awk -v t="$total_hours" -v a="$actual" 'BEGIN{printf "%.2f", t - a}')
+    series=$(echo "$series" | jq --arg d "$d" --arg label "$label" --argjson ideal "$ideal" --argjson actual "$actual" '. + [{date:$d, label:$label, ideal:$ideal, actual:$actual}]')
+  done
+
+  echo "=== Burndown: $display_name — \"$sprint_name\" ($sprint_start → $sprint_end) ==="
+  echo
+
+  command -v uvx >/dev/null || { echo "uvx (from 'uv') is required to render the chart." >&2; exit 1; }
+
+  BURNDOWN_SERIES="$series" \
+  BURNDOWN_TITLE="Burndown: $display_name — $sprint_name" \
+  BURNDOWN_MAX="$total_hours" \
+  BURNDOWN_TODAY="$today" \
+  uvx --quiet --from 'plotext==5.2.8' python3 - <<'PY'
+import json, os
+import plotext as plt
+
+data = json.loads(os.environ["BURNDOWN_SERIES"])
+title = os.environ["BURNDOWN_TITLE"]
+total = float(os.environ["BURNDOWN_MAX"])
+today = os.environ["BURNDOWN_TODAY"]
+
+dates = [d["label"] for d in data]
+ideal = [d["ideal"] for d in data]
+x = list(range(len(dates)))
+x_actual = [i for i, d in enumerate(data) if d["actual"] is not None]
+actual = [data[i]["actual"] for i in x_actual]
+
+width = min(100, max(40, len(x) * 6))
+plt.plotsize(width, 20)
+plt.theme("clear")
+plt.plot(x, ideal, label="ideal", color="gray")
+if actual:
+    plt.plot(x_actual, actual, label="actual", color="red")
+today_idx = next((i for i, d in enumerate(data) if d["date"] == today), None)
+if today_idx is not None:
+    plt.vline(today_idx, color="blue")
+plt.xticks(x, dates)
+plt.title(title)
+plt.xlabel("date")
+plt.ylabel("hours remaining")
+plt.ylim(0, max(total, max(ideal + actual)) * 1.05 if total > 0 else 1)
+plt.show()
+PY
+  echo
+
+  echo "-- Issues --"
+  echo "$issues" | jq -r '
+    sort_by(.key)
+    | .[] | "- \(.key): \(.hours)h — \(.status)\(if .done_date != "" then " (done \(.done_date))" else "" end) — \(.summary)"
+  '
+  echo
+
+  local remaining done_hours
+  remaining=$(echo "$series" | jq -r '[.[] | select(.actual != null)] | last | .actual // 0')
+  done_hours=$(awk -v t="$total_hours" -v r="$remaining" 'BEGIN{printf "%.2f", t - r}')
+  echo "Total estimated: ${total_hours}h   Remaining: ${remaining}h   Done: ${done_hours}h"
+}
+
+cmd_release() {
+  local project="${1:-${JIRA_PROJECT:-}}"
+  : "${project:?Set JIRA_PROJECT or pass a project key: jira release <PROJECT>}"
+  verify_auth
+
+  local versions
+  versions=$(api_get "$API/project/$project/versions")
+
+  local unreleased
+  unreleased=$(echo "$versions" | jq -c '
+    [.[] | select((.archived // false) == false and (.released // false) == false)]
+    | sort_by(.releaseDate // "9999-99-99")
+  ')
+
+  echo "Unreleased:"
+  if [ "$(echo "$unreleased" | jq 'length')" -eq 0 ]; then
+    echo "  none"
+  else
+    echo "$unreleased" | jq -r '
+      .[] | "  - \(.name) (id \(.id), \(if .releaseDate then "release date: \(.releaseDate)" else "no release date set" end))\(if .description and .description != "" then " — \(.description)" else "" end)"
+    '
+  fi
+
+  local last_released
+  last_released=$(echo "$versions" | jq -c '
+    [.[] | select((.archived // false) == false and (.released // false) == true)]
+    | sort_by(.releaseDate // "")
+    | last // empty
+  ')
+  if [ -z "$last_released" ] || [ "$last_released" = "null" ]; then
+    echo "Last released: none found."
+  else
+    echo "$last_released" | jq -r '"Last released: \(.name) (\(.releaseDate // "no release date set"))"'
+  fi
+}
+
+cmd_update() {
+  local task_id="${1:-}" status="${2:-}"
+  if [ -z "$task_id" ] || [ -z "$status" ]; then
+    echo "Usage: jira update TASK_ID STATUS" >&2
+    echo "STATUS is one of: todo, inprogress, review, done, closed" >&2
+    exit 1
+  fi
+
+  local env_var transition_id
+  case "$status" in
+    todo)       env_var="JIRA_TRANSITION_TODO" ;;
+    inprogress) env_var="JIRA_TRANSITION_INPROGRESS" ;;
+    review)     env_var="JIRA_TRANSITION_REVIEW" ;;
+    done)       env_var="JIRA_TRANSITION_DONE" ;;
+    closed)     env_var="JIRA_TRANSITION_CLOSED" ;;
+    *)
+      echo "Unknown STATUS '$status'. Must be one of: todo, inprogress, review, done, closed" >&2
+      exit 1
+      ;;
+  esac
+
+  transition_id="${!env_var:-}"
+  if [ -z "$transition_id" ]; then
+    echo "Set $env_var to the transition id for '$status' (find via: GET $API/issue/$task_id/transitions)" >&2
+    exit 1
+  fi
+
+  verify_auth
+  api_post "$API/issue/$task_id/transitions" "{\"transition\":{\"id\":\"$transition_id\"}}" >/dev/null
+  echo "$task_id -> $status (transition $transition_id)"
+}
+
+usage() {
+  cat >&2 <<EOF
+Usage: jira <command>
+
+Commands:
+  news     Lists my JIRA tasks (open, or in current sprint) as a markdown table.
+  verify   For JIRA_EMAIL, flags sprint/estimate hygiene issues and sprint hour totals.
+  sprint   Prints the current and future sprints of JIRA_BOARD_ID.
+  burndown jira burndown [--user EMAIL] [--sprint SPRINT_ID] - ASCII burndown chart (hours).
+  release  Lists unreleased versions (and the last released one) of JIRA_PROJECT.
+  update   jira update TASK_ID STATUS - transitions an issue (todo, inprogress, review, done, closed).
+EOF
+  exit 1
+}
+
+main() {
+  local cmd="${1:-}"
+  [ -z "$cmd" ] && usage
+  shift || true
+  case "$cmd" in
+    news) cmd_news "$@" ;;
+    verify) cmd_verify "$@" ;;
+    sprint) cmd_sprint "$@" ;;
+    burndown) cmd_burndown "$@" ;;
+    release) cmd_release "$@" ;;
+    update) cmd_update "$@" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
