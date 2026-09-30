@@ -12,7 +12,7 @@
 #   jira update   `jira update TASK_ID STATUS` transitions an issue. STATUS is one of:
 #                 todo, inprogress, review, done, closed.
 #
-# Required env vars (set them in a non-tracked file, e.g. ~/.zshrc.local):
+# Required env vars (set them in a non-tracked file, e.g. ~/.zshrc.local; checked per command by require_config):
 #   JIRA_BASE_URL    e.g. https://your-org.atlassian.net
 #   JIRA_EMAIL       your Atlassian login email
 #   JIRA_API_TOKEN   https://id.atlassian.com/manage-profile/security/api-tokens
@@ -26,24 +26,50 @@
 #   JIRA_TRANSITION_CLOSED      e.g. 41 (Closed, if distinct from Done on your workflow)
 # Optional:
 #   JIRA_ACCOUNT_ID  your Atlassian accountId (required by `jira news`)
-#   JIRA_SPRINT_FIELD  Jira custom field id holding sprints)
+#   JIRA_SPRINT_FIELD  Jira custom field id holding sprints (default customfield_10018)
 #   JIRA_PROJECT     default project key for `jira release` (e.g. PROJ); can be overridden with `jira release <PROJECT>`
 #   JIRA_VERIFY_SINCE_DAYS  how far back `jira verify` looks for non-Done issues (default 90)
 #   JIRA_VERIFY_DONE_DAYS   how far back `jira verify` looks for Done/Closed issues, measured from when they entered Done (default 14)
 
 set -euo pipefail
 
-: "${JIRA_BASE_URL:?Set JIRA_BASE_URL (e.g. https://your-org.atlassian.net)}"
-: "${JIRA_EMAIL:?Set JIRA_EMAIL}"
-: "${JIRA_API_TOKEN:?Set JIRA_API_TOKEN}"
-JIRA_ACCOUNT_ID="${JIRA_ACCOUNT_ID:-}"   # required by `jira news` only
-JIRA_SPRINT_FIELD="${JIRA_SPRINT_FIELD:?Set JIRA_SPRINT_FIELD}"
+# --- Config module ------------------------------------------------------------
+# Interface: require_config COMMAND
+#   Checks the environment COMMAND needs, exits with a hint when something is missing, and
+#   sets AUTH, API, AGILE_API and JIRA_SPRINT_FIELD. Commands read config; they never check it.
+config_extra_vars() {  # extra variables needed by a command, beyond the always-required ones
+  case "$1" in
+    news) echo "JIRA_ACCOUNT_ID" ;;
+    verify|sprint|burndown) echo "JIRA_BOARD_ID" ;;
+  esac
+}
 
-command -v jq >/dev/null || { echo "jq required" >&2; exit 1; }
+config_hint() {
+  case "$1" in
+    JIRA_BASE_URL)   echo "e.g. https://your-org.atlassian.net" ;;
+    JIRA_API_TOKEN)  echo "https://id.atlassian.com/manage-profile/security/api-tokens" ;;
+    JIRA_ACCOUNT_ID) echo "your Atlassian accountId" ;;
+    JIRA_BOARD_ID)   echo "see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>" ;;
+  esac
+}
 
-AUTH="${JIRA_EMAIL}:${JIRA_API_TOKEN}"
-API="${JIRA_BASE_URL%/}/rest/api/3"
-AGILE_API="${JIRA_BASE_URL%/}/rest/agile/1.0"
+require_config() {
+  local var hint
+  for var in JIRA_BASE_URL JIRA_EMAIL JIRA_API_TOKEN $(config_extra_vars "$1"); do
+    if [ -z "${!var:-}" ]; then
+      hint=$(config_hint "$var")
+      echo "Set $var${hint:+ ($hint)}" >&2
+      exit 1
+    fi
+  done
+  command -v jq >/dev/null || { echo "jq required" >&2; exit 1; }
+
+  JIRA_SPRINT_FIELD="${JIRA_SPRINT_FIELD:-customfield_10018}"
+  AUTH="${JIRA_EMAIL}:${JIRA_API_TOKEN}"
+  API="${JIRA_BASE_URL%/}/rest/api/3"
+  AGILE_API="${JIRA_BASE_URL%/}/rest/agile/1.0"
+}
+
 # Interactive only when stdin and stdout are terminals (checked here: command substitutions hide stdout).
 IS_TTY=0; [ -t 0 ] && [ -t 1 ] && IS_TTY=1
 
@@ -211,7 +237,6 @@ previous_sprint() {
 }
 
 cmd_news() {
-  : "${JIRA_ACCOUNT_ID:?Set JIRA_ACCOUNT_ID for jira news}"
   verify_auth
 
   local jql='assignee = currentUser() AND (statusCategory != Done OR sprint in openSprints()) ORDER BY updated DESC'
@@ -332,7 +357,6 @@ resolve_user_account_id() {
 }
 
 cmd_verify() {
-  : "${JIRA_BOARD_ID:?Set JIRA_BOARD_ID (see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>)}"
   verify_auth
 
   local sprint_id=""
@@ -447,7 +471,6 @@ cmd_verify() {
 }
 
 cmd_sprint() {
-  : "${JIRA_BOARD_ID:?Set JIRA_BOARD_ID (see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>)}"
   verify_auth
 
   local open state label
@@ -469,7 +492,6 @@ cmd_sprint() {
 }
 
 cmd_burndown() {
-  : "${JIRA_BOARD_ID:?Set JIRA_BOARD_ID (see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>)}"
   verify_auth
 
   local user="$JIRA_EMAIL" sprint_id=""
@@ -724,14 +746,12 @@ main() {
   [ -z "$cmd" ] && usage
   shift || true
   case "$cmd" in
-    news) cmd_news "$@" ;;
-    verify) cmd_verify "$@" ;;
-    sprint) cmd_sprint "$@" ;;
-    burndown) cmd_burndown "$@" ;;
-    release) cmd_release "$@" ;;
-    update) cmd_update "$@" ;;
+    news|verify|sprint|burndown|release|update) ;;
     *) usage ;;
   esac
+  require_config "$cmd"
+  "cmd_$cmd" "$@"
 }
 
-main "$@"
+# Run only when executed, so tests can source this file.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
