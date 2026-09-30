@@ -378,7 +378,7 @@ cmd_verify() {
         [.[] | select((.sprints // []) | any(.id == $sid)) | (.estimate_seconds // 0)] | add / 3600
       ')
       echo "Current sprint \"$sname\": ${hours}h estimated"
-      echo "$issues" | jq -r --argjson sid "$sid" --arg pp "${JIRA_PROJECT:-}-" '
+      echo "$issues" | jq -r --argjson sid "$sid" --arg pp "${JIRA_PROJECT:+$JIRA_PROJECT-}" '
         [.[] | select((.sprints // []) | any(.id == $sid)) | select(.key | startswith($pp)) | select(.estimate_seconds != null)]
         | sort_by(.key)
         | .[] | "  - \(.key): \(.estimate_seconds / 3600)h — \(.summary)"

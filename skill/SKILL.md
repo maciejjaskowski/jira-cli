@@ -25,7 +25,7 @@ From the user's sentence, extract:
 - **Sprint**: look for "this sprint" / "next sprint" / an explicit sprint name. If nothing
   is mentioned, default to **no sprint** (backlog) — don't assume "this sprint".
 - **Hour estimate**: e.g. "4h", "2 hours", "half a day".
-- **Parent**: an explicit issue key (e.g. `OCTO-1234`) or a description you can resolve
+- **Parent**: an explicit issue key (e.g. `PROJ-1234`) or a description you can resolve
   by searching. If ambiguous, ask rather than guess.
 - **Assignee**: a name/email in the text, else default to `JIRA_EMAIL` (the user).
 - **Description**: if the sentence doesn't give one distinct from the summary, **ask the
@@ -49,13 +49,13 @@ Print to the user a table
 
 | Field | Value |
 |---|---|
-| Project | OCTO |
+| Project | PROJ |
 | Type | Task |
-| Assignee | maciej.jaskowski@sonatus.com |
+| Assignee | you@example.com |
 | Component | Proj-Wolverine |
 | Sprint | Sprint 42 (or "Backlog — none") |
 | TimeTracking | 4h (or "none") |
-| Parent | CLOUDAI-1234 (or "none") |
+| Parent | PROJ-1234 (or "none") |
 | Fix version | ... |
 | Summary | ... |
 | Description | ... |
