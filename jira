@@ -118,23 +118,24 @@ verify_auth() {
   api_get "$API/myself" >/dev/null
 }
 
-# Fetch all issue keys matching a JQL, via cursor-based pagination.
-fetch_keys() {
-  local jql="$1" fields="$2"
+# Fetch all issues matching a JQL (cursor pagination) as one JSON array.
+# Usage: fetch_issues JQL FIELDS [EXPAND]   e.g. fetch_issues "$jql" "summary,status" changelog
+# Each element is the issue as returned by /search/jql: {key, fields: {FIELDS...}, changelog?}.
+fetch_issues() {
+  local jql="$1" fields="$2" expand="${3:-}"
   local -a args
-  local keys=() next_token="" page_size=100 resp count is_last
+  local lines="" next_token="" page_size=100 resp is_last
 
   while :; do
     args=(-G "$API/search/jql" \
       --data-urlencode "jql=$jql" \
       --data-urlencode "fields=$fields" \
       --data-urlencode "maxResults=$page_size")
+    [ -n "$expand" ] && args+=(--data-urlencode "expand=$expand")
     [ -n "$next_token" ] && args+=(--data-urlencode "nextPageToken=$next_token")
 
     resp=$(api_get "${args[@]}")
-    count=$(echo "$resp" | jq '.issues | length')
-    [ "$count" -eq 0 ] && break
-    while IFS= read -r line; do keys+=("$line"); done < <(echo "$resp" | jq -r '.issues[].key')
+    lines+=$(echo "$resp" | jq -c '.issues[]')$'\n'
 
     is_last=$(echo "$resp" | jq -r '.isLast // true')
     [ "$is_last" = "true" ] && break
@@ -142,7 +143,7 @@ fetch_keys() {
     [ -z "$next_token" ] && break
   done
 
-  printf '%s\n' "${keys[@]}"
+  printf '%s' "$lines" | jq -s -c '.'
 }
 
 # Fetch all sprints of a board in a given state (active|future|closed), via offset pagination.
@@ -214,59 +215,40 @@ cmd_news() {
   verify_auth
 
   local jql='assignee = currentUser() AND (statusCategory != Done OR sprint in openSprints()) ORDER BY updated DESC'
-  local keys=()
-  while IFS= read -r line; do [ -n "$line" ] && keys+=("$line"); done < <(fetch_keys "$jql" "summary,status,${JIRA_SPRINT_FIELD}")
+  local issues
+  issues=$(fetch_issues "$jql" "summary,status,${JIRA_SPRINT_FIELD},comment,issuelinks,timeoriginalestimate,timespent" changelog)
 
-  if [ "${#keys[@]}" -eq 0 ]; then
+  if [ "$(echo "$issues" | jq 'length')" -eq 0 ]; then
     echo "No issues found." >&2
     exit 0
   fi
 
-  local rows="[]"
-
-  for key in "${keys[@]}"; do
-    issue=$(api_get "$API/issue/$key?fields=summary,status,${JIRA_SPRINT_FIELD},comment,issuelinks,timeoriginalestimate,timespent&expand=changelog")
-
-    summary=$(echo "$issue" | jq -r '.fields.summary')
-    status=$(echo "$issue" | jq -r '.fields.status.name')
-    sprint=$(echo "$issue" | jq -r --arg sf "$JIRA_SPRINT_FIELD" '
-      (.fields[$sf] // []) as $sprints
-      | ($sprints | map(select(.state == "active"))) as $active
-      | if ($active | length) > 0 then $active[0].name
-        else ($sprints[-1].name // "")
-        end
-    ')
-
-    # Hours: original estimate and time spent (seconds -> hours), "" when unset.
-    hours=$(echo "$issue" | jq -r '
-      def h: if . == null then "-" else ((. / 360 | round) / 10 | tostring) end;
-      if (.fields.timeoriginalestimate == null and .fields.timespent == null) then ""
-      else "\(.fields.timespent // 0 | h)h / \(.fields.timeoriginalestimate | h)h" end
-    ')
-
-    # "Parent-Child" issue link type (id 10206): outwardIssue = "is parent of" us, inwardIssue = a child of us.
-    parent=$(echo "$issue" | jq -r '
-      [.fields.issuelinks[]? | select(.type.id == "10206") | .outwardIssue.key] | first // ""
-    ')
-
-    last_change=$(echo "$issue" | jq -r --arg me "$JIRA_ACCOUNT_ID" '
-      ([.changelog.histories[]?
-        | select(.author.accountId != $me)
-        | select(any(.items[]?; .field == "description"))
-        | .created
-       ]
-       +
-       [.fields.comment.comments[]?
-        | select(.author.accountId != $me)
-        | (.updated // .created)
-       ])
-      | sort | last // ""
-    ')
-
-    rows=$(echo "$rows" | jq --arg key "$key" --arg status "$status" --arg sprint "$sprint" \
-      --arg summary "$summary" --arg last "$last_change" --arg base "$JIRA_BASE_URL" --arg parent "$parent" --arg hours "$hours" \
-      '. + [{key:$key, status:$status, sprint:$sprint, summary:$summary, last:$last, base:$base, parent:$parent, hours:$hours}]')
-  done
+  # One row per issue. Hours: original estimate and time spent (seconds -> hours), "" when unset.
+  # Parent: "Parent-Child" issue link type (id 10206): outwardIssue = "is parent of" us.
+  # last: newest description edit or comment by someone other than me.
+  local rows
+  rows=$(echo "$issues" | jq -c --arg sf "$JIRA_SPRINT_FIELD" --arg me "$JIRA_ACCOUNT_ID" --arg base "$JIRA_BASE_URL" '
+    def h: if . == null then "-" else ((. / 360 | round) / 10 | tostring) end;
+    map({
+      key: .key,
+      status: .fields.status.name,
+      sprint: ((.fields[$sf] // []) as $sprints
+        | ($sprints | map(select(.state == "active"))) as $active
+        | if ($active | length) > 0 then $active[0].name else ($sprints[-1].name // "") end),
+      summary: .fields.summary,
+      last: (([.changelog.histories[]?
+                | select(.author.accountId != $me)
+                | select(any(.items[]?; .field == "description"))
+                | .created]
+              + [.fields.comment.comments[]?
+                  | select(.author.accountId != $me)
+                  | (.updated // .created)])
+             | sort | last // ""),
+      base: $base,
+      parent: ([.fields.issuelinks[]? | select(.type.id == "10206") | .outwardIssue.key] | first // ""),
+      hours: (if (.fields.timeoriginalestimate == null and .fields.timespent == null) then ""
+              else "\(.fields.timespent // 0 | h)h / \(.fields.timeoriginalestimate | h)h" end)
+    })')
 
   # Sort: status group first (Done, In Review, In Progress, To Do, other), then newest last_change within group
   local status_rank='{"Done":0,"In Review":1,"In Progress":2,"To Do":3}'
@@ -371,26 +353,16 @@ cmd_verify() {
   local since_days="${JIRA_VERIFY_SINCE_DAYS:-90}"
   local done_days="${JIRA_VERIFY_DONE_DAYS:-14}"
   local jql="assignee = \"$account_id\" AND ((statusCategory != Done AND updated >= -${since_days}d) OR (statusCategory = Done AND statusCategoryChangedDate >= -${done_days}d)) ORDER BY updated DESC"
-  local keys=()
-  while IFS= read -r line; do [ -n "$line" ] && keys+=("$line"); done < <(fetch_keys "$jql" "summary,status,${JIRA_SPRINT_FIELD},timeoriginalestimate")
+  local issues
+  issues=$(fetch_issues "$jql" "summary,status,${JIRA_SPRINT_FIELD},timeoriginalestimate" \
+    | jq -c --arg base "$JIRA_BASE_URL" --arg sf "$JIRA_SPRINT_FIELD" '
+        map({key: .key, base: $base, summary: .fields.summary, status: .fields.status.name,
+             estimate_seconds: .fields.timeoriginalestimate, sprints: (.fields[$sf] // [])})')
 
-  if [ "${#keys[@]}" -eq 0 ]; then
+  if [ "$(echo "$issues" | jq 'length')" -eq 0 ]; then
     echo "No issues found for JIRA_EMAIL='$JIRA_EMAIL' (accountId=$account_id)." >&2
     exit 0
   fi
-
-  local issues="[]"
-  for key in "${keys[@]}"; do
-    issue=$(api_get "$API/issue/$key?fields=summary,status,${JIRA_SPRINT_FIELD},timeoriginalestimate")
-    issues=$(echo "$issues" | jq --arg key "$key" --arg base "$JIRA_BASE_URL" --arg sf "$JIRA_SPRINT_FIELD" --argjson issue "$issue" '. + [{
-      key: $key,
-      base: $base,
-      summary: $issue.fields.summary,
-      status: $issue.fields.status.name,
-      estimate_seconds: $issue.fields.timeoriginalestimate,
-      sprints: ($issue.fields[$sf] // [])
-    }]')
-  done
 
   display_name=$(api_get -G "$API/user" --data-urlencode "accountId=$account_id" | jq -r '.displayName // "'"$JIRA_EMAIL"'"')
 
@@ -534,37 +506,26 @@ cmd_burndown() {
   fi
 
   local jql="assignee = \"$account_id\" AND sprint = $sprint_id"
-  local keys=()
-  while IFS= read -r line; do [ -n "$line" ] && keys+=("$line"); done < <(fetch_keys "$jql" "summary,status,timeoriginalestimate")
+  # hours: estimate in hours. done_date: when the issue last moved to Done/Closed, but only
+  # while it is *currently* Done/Closed (a reopened issue has not burned down).
+  local issues
+  issues=$(fetch_issues "$jql" "summary,status,timeoriginalestimate" changelog | jq -c '
+    map(.fields.status.name as $status | {
+      key: .key,
+      summary: .fields.summary,
+      status: $status,
+      hours: ((.fields.timeoriginalestimate // 0) / 3600),
+      done_date: (if $status == "Done" or $status == "Closed" then
+          ([.changelog.histories[]?
+             | select(any(.items[]?; .field == "status" and (.toString == "Done" or .toString == "Closed")))
+             | .created] | sort | last // "" | .[0:10])
+        else "" end)
+    })')
 
-  if [ "${#keys[@]}" -eq 0 ]; then
+  if [ "$(echo "$issues" | jq 'length')" -eq 0 ]; then
     echo "No issues assigned to $display_name in sprint \"$sprint_name\"." >&2
     exit 0
   fi
-
-  local issues="[]" issue summary status hours done_date
-  for key in "${keys[@]}"; do
-    issue=$(api_get "$API/issue/$key?fields=summary,status,timeoriginalestimate&expand=changelog")
-    summary=$(echo "$issue" | jq -r '.fields.summary')
-    status=$(echo "$issue" | jq -r '.fields.status.name')
-    hours=$(echo "$issue" | jq -r '(.fields.timeoriginalestimate // 0) / 3600')
-
-    # Last time this issue's status changed to Done/Closed.
-    done_date=$(echo "$issue" | jq -r '
-      [.changelog.histories[]?
-        | select(any(.items[]?; .field == "status" and (.toString == "Done" or .toString == "Closed")))
-        | .created]
-      | sort | last // empty
-    ' | cut -c1-10)
-    # Only counts as burned down if the issue is *currently* Done/Closed (not reopened since).
-    if [ "$status" != "Done" ] && [ "$status" != "Closed" ]; then
-      done_date=""
-    fi
-
-    issues=$(echo "$issues" | jq --arg key "$key" --arg summary "$summary" --arg status "$status" \
-      --argjson hours "$hours" --arg done_date "$done_date" \
-      '. + [{key:$key, summary:$summary, status:$status, hours:$hours, done_date:$done_date}]')
-  done
 
   local total_hours
   total_hours=$(echo "$issues" | jq '[.[].hours] | add')
