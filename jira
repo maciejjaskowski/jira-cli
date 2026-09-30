@@ -356,6 +356,48 @@ resolve_user_account_id() {
   echo "$account_id"
 }
 
+# --- Verify report module -----------------------------------------------------
+# Interface: verify_report < input.json   (prints the report; no API calls)
+# input: {display_name, account_id, project_prefix,
+#         issues:   [{key, base, summary, status, estimate_seconds, sprints:[{id,...}]}],
+#         targets:  [sprint],        selected sprints
+#         previous: sprint | null}   sprint before the earliest target
+# Sprint identity comes from the board (targets/previous), not from whichever sprints happen
+# to be attached to this user's own issues.
+verify_report() {
+  jq -r '
+    .issues as $issues | .targets as $targets | .previous as $prev
+    | .display_name as $name | .project_prefix as $pp
+    | def link: "- [\(.key)](\(.base)/browse/\(.key)) \u2014 \(.status) | \(.summary)";
+      def in_sprint($sid): (.sprints // []) | any(.id == $sid);
+      def hours($sid): ([$issues[] | select(in_sprint($sid)) | (.estimate_seconds // 0)] | add // 0) / 3600;
+      def section: if length == 0 then "(none)" else join("\n") end;
+    "=== jira verify: \($name) (\(.account_id)) ===",
+    "",
+    "-- In progress/review/done with NO sprint --",
+    ([$issues[] | select(.status == "In Progress" or .status == "In Review" or .status == "Done")
+                | select((.sprints // []) | length == 0) | link] | section),
+    "",
+    "-- Assigned, in selected sprint, with NO hour estimate --",
+    ([$issues[] | select(.estimate_seconds == null)
+                | select((.sprints // []) | any(.id as $i | $targets | any(.id == $i))) | link] | section),
+    "",
+    "-- Sprint hour estimates --",
+    (if ($targets | length) == 0 then "Selected sprint: none found."
+     else $targets[] | . as $s
+       | "Sprint \"\($s.name)\" (\($s.state)): \(hours($s.id))h estimated",
+         ([$issues[] | select(in_sprint($s.id)) | select(.key | startswith($pp)) | select(.estimate_seconds != null)]
+          | sort_by(.key) | .[] | "  - \(.key): \(.estimate_seconds / 3600)h \u2014 \(.summary)")
+     end),
+    (if $prev == null then "Previous sprint: none found."
+     else "Previous sprint \"\($prev.name)\": \(hours($prev.id))h estimated" end),
+    "",
+    ([$issues[] | select(.status == "In Progress")] | length) as $n
+    | if $n == 0 then "\u26a0 No task is currently In Progress for \($name)."
+      else "OK: \($n) task(s) In Progress." end
+  '
+}
+
 cmd_verify() {
   verify_auth
 
@@ -390,84 +432,13 @@ cmd_verify() {
 
   display_name=$(api_get -G "$API/user" --data-urlencode "accountId=$account_id" | jq -r '.displayName // "'"$JIRA_EMAIL"'"')
 
-  echo "=== jira verify: $display_name ($account_id) ==="
-  echo
-
-  # 1. In progress / in review / done, but not in any sprint.
-  echo "-- In progress/review/done with NO sprint --"
-  local no_sprint
-  no_sprint=$(echo "$issues" | jq -r '
-    [.[] | select(.status == "In Progress" or .status == "In Review" or .status == "Done")
-         | select((.sprints // []) | length == 0)]
-    | .[] | "- [\(.key)](\(.base)/browse/\(.key)) — \(.status) | \(.summary)"
-  ')
-  if [ -z "$no_sprint" ]; then
-    echo "(none)"
-  else
-    echo "$no_sprint"
-  fi
-  echo
-
-  # 2. Assigned but no hour estimate.
-  echo "-- Assigned, in selected sprint, with NO hour estimate --"
-  local no_estimate
-  no_estimate=$(echo "$issues" | jq -r --argjson ts "$target_sprints" '
-    [.[] | select(.estimate_seconds == null) | select((.sprints // []) | any(.id as $i | $ts | any(.id == $i)))]
-    | .[] | "- [\(.key)](\(.base)/browse/\(.key)) — \(.status) | \(.summary)"
-  ')
-  if [ -z "$no_estimate" ]; then
-    echo "(none)"
-  else
-    echo "$no_estimate"
-  fi
-  echo
-
-  # 3. Current and previous sprint hour totals (sprint identity comes from the board, not from
-  # whichever sprints happen to be attached to this user's own issues).
-  echo "-- Sprint hour estimates --"
-  if [ "$(echo "$target_sprints" | jq 'length')" -eq 0 ]; then
-    echo "Selected sprint: none found."
-  else
-    echo "$target_sprints" | jq -c '.[]' | while IFS= read -r sprint; do
-      local sid sname sstate hours
-      sid=$(echo "$sprint" | jq -r '.id')
-      sname=$(echo "$sprint" | jq -r '.name')
-      sstate=$(echo "$sprint" | jq -r '.state')
-      hours=$(echo "$issues" | jq --argjson sid "$sid" '
-        [.[] | select((.sprints // []) | any(.id == $sid)) | (.estimate_seconds // 0)] | add / 3600
-      ')
-      echo "Sprint \"$sname\" ($sstate): ${hours}h estimated"
-      echo "$issues" | jq -r --argjson sid "$sid" --arg pp "${JIRA_PROJECT:+$JIRA_PROJECT-}" '
-        [.[] | select((.sprints // []) | any(.id == $sid)) | select(.key | startswith($pp)) | select(.estimate_seconds != null)]
-        | sort_by(.key)
-        | .[] | "  - \(.key): \(.estimate_seconds / 3600)h — \(.summary)"
-      '
-    done
-  fi
-
   local prev_sprint
   prev_sprint=$(previous_sprint "$target_sprints")
-  if [ -z "$prev_sprint" ]; then
-    echo "Previous sprint: none found."
-  else
-    local psid psname phours
-    psid=$(echo "$prev_sprint" | jq -r '.id')
-    psname=$(echo "$prev_sprint" | jq -r '.name')
-    phours=$(echo "$issues" | jq --argjson sid "$psid" '
-      [.[] | select((.sprints // []) | any(.id == $sid)) | (.estimate_seconds // 0)] | add / 3600
-    ')
-    echo "Previous sprint \"$psname\": ${phours}h estimated"
-  fi
-  echo
 
-  # 4. No task in progress.
-  local in_progress_count
-  in_progress_count=$(echo "$issues" | jq '[.[] | select(.status == "In Progress")] | length')
-  if [ "$in_progress_count" -eq 0 ]; then
-    echo "⚠ No task is currently In Progress for $display_name."
-  else
-    echo "OK: $in_progress_count task(s) In Progress."
-  fi
+  jq -n --arg name "$display_name" --arg id "$account_id" --arg pp "${JIRA_PROJECT:+$JIRA_PROJECT-}" \
+      --argjson issues "$issues" --argjson targets "$target_sprints" --argjson previous "${prev_sprint:-null}" \
+      '{display_name: $name, account_id: $id, project_prefix: $pp, issues: $issues, targets: $targets, previous: $previous}' \
+    | verify_report
 }
 
 cmd_sprint() {
