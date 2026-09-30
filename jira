@@ -2,12 +2,12 @@
 # jira - small JIRA CLI.
 #
 # Subcommands:
-#   jira news     Lists my JIRA tasks (open, or in current sprint) as an Obsidian-pastable markdown table.
-#   jira verify   For JIRA_EMAIL, flags sprint/estimate hygiene issues and reports sprint hour totals.
+#   jira news     Lists my JIRA tasks (open, or in current sprint) as an Obsidian-pastable markdown list (incl. hours: spent / estimate).
+#   jira verify [--sprint ID]  For JIRA_EMAIL, picks an active/future sprint via fzf, flags sprint/estimate hygiene issues and reports sprint hour totals.
 #   jira sprint   Prints the current and future sprints of JIRA_BOARD_ID.
 #   jira burndown `jira burndown [--user EMAIL] [--sprint SPRINT_ID]` prints an ASCII burndown
-#                 chart (hours) for a user's issues in a sprint. Omit --sprint to pick from active
-#                 sprints via fzf; omit --user to default to JIRA_EMAIL.
+#                 chart (hours) for a user's issues in a sprint. Omit --sprint to pick from active or
+#                 future sprints via fzf; omit --user to default to JIRA_EMAIL.
 #   jira release  Lists unreleased versions (and the last released one) of JIRA_PROJECT, or `jira release <PROJECT>`.
 #   jira update   `jira update TASK_ID STATUS` transitions an issue. STATUS is one of:
 #                 todo, inprogress, review, done, closed.
@@ -26,7 +26,7 @@
 #   JIRA_TRANSITION_CLOSED      e.g. 41 (Closed, if distinct from Done on your workflow)
 # Optional:
 #   JIRA_ACCOUNT_ID  your Atlassian accountId (required by `jira news`)
-#   JIRA_SPRINT_FIELD  Jira custom field id holding sprints (default customfield_10018; differs per instance)
+#   JIRA_SPRINT_FIELD  Jira custom field id holding sprints)
 #   JIRA_PROJECT     default project key for `jira release` (e.g. PROJ); can be overridden with `jira release <PROJECT>`
 #   JIRA_VERIFY_SINCE_DAYS  how far back `jira verify` looks for non-Done issues (default 90)
 #   JIRA_VERIFY_DONE_DAYS   how far back `jira verify` looks for Done/Closed issues, measured from when they entered Done (default 14)
@@ -37,7 +37,7 @@ set -euo pipefail
 : "${JIRA_EMAIL:?Set JIRA_EMAIL}"
 : "${JIRA_API_TOKEN:?Set JIRA_API_TOKEN}"
 JIRA_ACCOUNT_ID="${JIRA_ACCOUNT_ID:-}"   # required by `jira news` only
-JIRA_SPRINT_FIELD="${JIRA_SPRINT_FIELD:-customfield_10018}"
+JIRA_SPRINT_FIELD="${JIRA_SPRINT_FIELD:?Set JIRA_SPRINT_FIELD}"
 
 command -v jq >/dev/null || { echo "jq required" >&2; exit 1; }
 
@@ -179,7 +179,7 @@ cmd_news() {
   local rows="[]"
 
   for key in "${keys[@]}"; do
-    issue=$(api_get "$API/issue/$key?fields=summary,status,${JIRA_SPRINT_FIELD},comment,issuelinks&expand=changelog")
+    issue=$(api_get "$API/issue/$key?fields=summary,status,${JIRA_SPRINT_FIELD},comment,issuelinks,timeoriginalestimate,timespent&expand=changelog")
 
     summary=$(echo "$issue" | jq -r '.fields.summary')
     status=$(echo "$issue" | jq -r '.fields.status.name')
@@ -189,6 +189,13 @@ cmd_news() {
       | if ($active | length) > 0 then $active[0].name
         else ($sprints[-1].name // "")
         end
+    ')
+
+    # Hours: original estimate and time spent (seconds -> hours), "" when unset.
+    hours=$(echo "$issue" | jq -r '
+      def h: if . == null then "-" else ((. / 360 | round) / 10 | tostring) end;
+      if (.fields.timeoriginalestimate == null and .fields.timespent == null) then ""
+      else "\(.fields.timespent // 0 | h)h / \(.fields.timeoriginalestimate | h)h" end
     ')
 
     # "Parent-Child" issue link type (id 10206): outwardIssue = "is parent of" us, inwardIssue = a child of us.
@@ -211,8 +218,8 @@ cmd_news() {
     ')
 
     rows=$(echo "$rows" | jq --arg key "$key" --arg status "$status" --arg sprint "$sprint" \
-      --arg summary "$summary" --arg last "$last_change" --arg base "$JIRA_BASE_URL" --arg parent "$parent" \
-      '. + [{key:$key, status:$status, sprint:$sprint, summary:$summary, last:$last, base:$base, parent:$parent}]')
+      --arg summary "$summary" --arg last "$last_change" --arg base "$JIRA_BASE_URL" --arg parent "$parent" --arg hours "$hours" \
+      '. + [{key:$key, status:$status, sprint:$sprint, summary:$summary, last:$last, base:$base, parent:$parent, hours:$hours}]')
   done
 
   # Sort: status group first (Done, In Review, In Progress, To Do, other), then newest last_change within group
@@ -230,7 +237,7 @@ cmd_news() {
   esc() { printf '%s' "$1" | sed 's/|/\\|/g'; }
 
   print_row() {
-    local row="$1" depth="$2" key base status sprint summary last indent parent_note
+    local row="$1" depth="$2" key base status sprint summary last indent parent_note hours
     key=$(echo "$row" | jq -r '.key')
     base=$(echo "$row" | jq -r '.base')
     status=$(echo "$row" | jq -r '.status')
@@ -238,14 +245,15 @@ cmd_news() {
     summary=$(echo "$row" | jq -r '.summary')
     last=$(echo "$row" | jq -r '.last')
     parent=$(echo "$row" | jq -r '.parent')
+    hours=$(echo "$row" | jq -r '.hours')
     [ -n "$last" ] && last=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${last:0:19}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$last")
     indent=$(printf '%*s' $((depth * 2)) '')
     parent_note=""
     if [ "$depth" -eq 0 ] && [ -n "$parent" ]; then
       parent_note=" _(parent: [$parent]($base/browse/$parent), not in this list)_"
     fi
-    printf "%s- [%s](%s/browse/%s) — %s | %s | %s | %s%s\n" \
-      "$indent" "$key" "$base" "$key" "$(esc "$status")" "$(esc "$sprint")" "$(esc "$summary")" "$last" "$parent_note"
+    printf "%s- [%s](%s/browse/%s) — %s | %s | %s | %s | %s%s\n" \
+      "$indent" "$key" "$base" "$key" "$(esc "$status")" "$(esc "$sprint")" "$(esc "$summary")" "$last" "$hours" "$parent_note"
   }
 
   # Recursively print a node and its children (children = rows whose .parent == this key).
@@ -299,6 +307,32 @@ cmd_verify() {
   : "${JIRA_BOARD_ID:?Set JIRA_BOARD_ID (see GET \$JIRA_BASE_URL/rest/agile/1.0/board?projectKeyOrId=<PROJECT>)}"
   verify_auth
 
+  local sprint_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sprint) sprint_id="${2:?--sprint requires a value}"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; echo "Usage: jira verify [--sprint SPRINT_ID]" >&2; exit 1 ;;
+    esac
+  done
+
+  # Pick the sprint to report on (active or future) before the slow issue fetch.
+  # Without --sprint and without a terminal/fzf, fall back to all active sprints.
+  local active_sprints future_sprints closed_sprints target_sprints
+  active_sprints=$(fetch_board_sprints "$JIRA_BOARD_ID" "active")
+  future_sprints=$(fetch_board_sprints "$JIRA_BOARD_ID" "future" | jq -c 'sort_by(.startDate // "9999")')
+  if [ -n "$sprint_id" ]; then
+    target_sprints=$(api_get "$AGILE_API/sprint/$sprint_id" | jq -c '[.]')
+  elif command -v fzf >/dev/null && [ -t 0 ] && [ -t 1 ] \
+      && [ "$(jq -n --argjson a "$active_sprints" --argjson f "$future_sprints" '($a + $f) | length')" -gt 0 ]; then
+    local picked
+    picked=$(jq -nr --argjson a "$active_sprints" --argjson f "$future_sprints" '($a + $f)[] | "\(.id)\t[\(.state)] \(.name) (\((.startDate // "?")[0:10]) → \((.endDate // "?")[0:10]))"' \
+      | fzf --with-nth=2 --delimiter='\t' --prompt="Sprint> ")
+    [ -z "$picked" ] && { echo "No sprint selected." >&2; exit 1; }
+    target_sprints=$(api_get "$AGILE_API/sprint/$(printf '%s' "$picked" | cut -f1)" | jq -c '[.]')
+  else
+    target_sprints="$active_sprints"
+  fi
+
   local account_id display_name
   account_id=$(resolve_user_account_id "$JIRA_EMAIL")
 
@@ -347,10 +381,10 @@ cmd_verify() {
   echo
 
   # 2. Assigned but no hour estimate.
-  echo "-- Assigned, in current sprint, with NO hour estimate --"
+  echo "-- Assigned, in selected sprint, with NO hour estimate --"
   local no_estimate
-  no_estimate=$(echo "$issues" | jq -r '
-    [.[] | select(.estimate_seconds == null) | select((.sprints // []) | any(.state == "active"))]
+  no_estimate=$(echo "$issues" | jq -r --argjson ts "$target_sprints" '
+    [.[] | select(.estimate_seconds == null) | select((.sprints // []) | any(.id as $i | $ts | any(.id == $i)))]
     | .[] | "- [\(.key)](\(.base)/browse/\(.key)) — \(.status) | \(.summary)"
   ')
   if [ -z "$no_estimate" ]; then
@@ -363,21 +397,27 @@ cmd_verify() {
   # 3. Current and previous sprint hour totals (sprint identity comes from the board, not from
   # whichever sprints happen to be attached to this user's own issues).
   echo "-- Sprint hour estimates --"
-  local active_sprints closed_sprints
-  active_sprints=$(fetch_board_sprints "$JIRA_BOARD_ID" "active")
-  closed_sprints=$(fetch_board_sprints "$JIRA_BOARD_ID" "closed" | jq -c 'sort_by(.endDate // "") | reverse')
+  # "Previous" = the sprint starting latest before the earliest selected sprint starts (closed, or active when a future sprint is selected).
+  closed_sprints=$(fetch_board_sprints "$JIRA_BOARD_ID" "closed" \
+    | jq -c --argjson a "$active_sprints" --argjson t "$target_sprints" '
+        ($t | map(.startDate // "") | min // "") as $ts
+        | ($t | map(.id)) as $tids
+        | (. + $a) | map(select(.id as $i | $tids | index($i) | not))
+        | map(select(($ts == "") or ((.startDate // "") != "" and .startDate < $ts)))
+        | sort_by(.startDate // "") | reverse')
 
-  if [ "$(echo "$active_sprints" | jq 'length')" -eq 0 ]; then
-    echo "Current sprint: none found."
+  if [ "$(echo "$target_sprints" | jq 'length')" -eq 0 ]; then
+    echo "Selected sprint: none found."
   else
-    echo "$active_sprints" | jq -c '.[]' | while IFS= read -r sprint; do
-      local sid sname hours
+    echo "$target_sprints" | jq -c '.[]' | while IFS= read -r sprint; do
+      local sid sname sstate hours
       sid=$(echo "$sprint" | jq -r '.id')
       sname=$(echo "$sprint" | jq -r '.name')
+      sstate=$(echo "$sprint" | jq -r '.state')
       hours=$(echo "$issues" | jq --argjson sid "$sid" '
         [.[] | select((.sprints // []) | any(.id == $sid)) | (.estimate_seconds // 0)] | add / 3600
       ')
-      echo "Current sprint \"$sname\": ${hours}h estimated"
+      echo "Sprint \"$sname\" ($sstate): ${hours}h estimated"
       echo "$issues" | jq -r --argjson sid "$sid" --arg pp "${JIRA_PROJECT:+$JIRA_PROJECT-}" '
         [.[] | select((.sprints // []) | any(.id == $sid)) | select(.key | startswith($pp)) | select(.estimate_seconds != null)]
         | sort_by(.key)
@@ -455,17 +495,19 @@ cmd_burndown() {
   display_name=$(api_get -G "$API/user" --data-urlencode "accountId=$account_id" | jq -r --arg u "$user" '.displayName // $u')
 
   if [ -z "$sprint_id" ]; then
-    local active
+    local active future candidates
     active=$(fetch_board_sprints "$JIRA_BOARD_ID" "active")
-    if [ "$(echo "$active" | jq 'length')" -eq 0 ]; then
-      echo "No active sprints found on board $JIRA_BOARD_ID. Pass --sprint SPRINT_ID for a closed sprint." >&2
+    future=$(fetch_board_sprints "$JIRA_BOARD_ID" "future" | jq -c 'sort_by(.startDate // "9999")')
+    candidates=$(jq -n --argjson a "$active" --argjson f "$future" '$a + $f')
+    if [ "$(echo "$candidates" | jq 'length')" -eq 0 ]; then
+      echo "No active or future sprints found on board $JIRA_BOARD_ID. Pass --sprint SPRINT_ID for a closed sprint." >&2
       exit 1
     fi
     command -v fzf >/dev/null || { echo "fzf is required to pick a sprint (or pass --sprint SPRINT_ID explicitly)." >&2; exit 1; }
     [ -t 0 ] && [ -t 1 ] || { echo "Not running in a terminal; pass --sprint SPRINT_ID explicitly." >&2; exit 1; }
 
     local picked
-    picked=$(echo "$active" | jq -r '.[] | "\(.id)\t\(.name) (\((.startDate // "?")[0:10]) → \((.endDate // "?")[0:10]))"' \
+    picked=$(echo "$candidates" | jq -r '.[] | "\(.id)\t[\(.state)] \(.name) (\((.startDate // "?")[0:10]) → \((.endDate // "?")[0:10]))"' \
       | fzf --with-nth=2 --delimiter='\t' --prompt="Sprint> ")
     [ -z "$picked" ] && { echo "No sprint selected." >&2; exit 1; }
     sprint_id=$(printf '%s' "$picked" | cut -f1)
@@ -524,7 +566,9 @@ cmd_burndown() {
   # (or through the end date once the sprint is closed) - later days get a null actual.
   local today last_actual_day
   today=$(date +%Y-%m-%d)
-  if [ "$sprint_state" = "active" ] && [[ "$today" < "$sprint_end" ]]; then
+  if [ "$sprint_state" = "future" ]; then
+    last_actual_day=""  # not started: no actual data, only the ideal line
+  elif [ "$sprint_state" = "active" ] && [[ "$today" < "$sprint_end" ]]; then
     last_actual_day="$today"
   else
     last_actual_day="$sprint_end"
@@ -697,7 +741,7 @@ Usage: jira <command>
 
 Commands:
   news     Lists my JIRA tasks (open, or in current sprint) as a markdown table.
-  verify   For JIRA_EMAIL, flags sprint/estimate hygiene issues and sprint hour totals.
+  verify   jira verify [--sprint SPRINT_ID] - sprint/estimate hygiene + hour totals; picks active/future sprint via fzf.
   sprint   Prints the current and future sprints of JIRA_BOARD_ID.
   burndown jira burndown [--user EMAIL] [--sprint SPRINT_ID] - ASCII burndown chart (hours).
   release  Lists unreleased versions (and the last released one) of JIRA_PROJECT.

@@ -1,6 +1,6 @@
 # jira-cli
 
-Small Bash CLI for Jira Cloud. Requires `bash`, `curl`, `jq`. `fzf` is used by `jira burndown` to pick a sprint.
+Small Bash CLI for Jira Cloud. Requires `bash`, `curl`, `jq`. `fzf` is used by `jira burndown` and `jira verify` to pick a sprint.
 
 ## Install
 ```
@@ -11,7 +11,7 @@ ln -s "$PWD/jira" ~/.local/bin/jira
 | Command | What it does |
 |---|---|
 | `jira news` | Lists your open or current-sprint tasks as a markdown table |
-| `jira verify` | Flags sprint/estimate hygiene issues, reports sprint hour totals |
+| `jira verify [--sprint ID]` | Flags sprint/estimate hygiene issues, reports sprint hour totals; picks active/future sprint via fzf |
 | `jira sprint` | Prints current and future sprints of the board |
 | `jira burndown [--user EMAIL] [--sprint ID]` | ASCII burndown chart (hours) |
 | `jira release [PROJECT]` | Lists unreleased versions and the last released one |
