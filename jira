@@ -462,6 +462,36 @@ cmd_sprint() {
   done
 }
 
+# --- Burndown series module ---------------------------------------------------
+# Interface: burndown_series < input.json   (prints the series as a JSON array; pure, no API calls)
+# input:  {issues: [{hours, done_date "YYYY-MM-DD" or ""}], start, end "YYYY-MM-DD", state, today}
+# output: [{date, label, ideal, actual}], first a virtual "start" point at 100%, then one point per
+#         calendar day of the sprint holding the *end-of-day* value, so day 1 drops from 100% to ~90%.
+#         ideal falls linearly over the sprint's Mon-Fri days. actual counts issues done on or before
+#         that day; it is null after today (active sprint) or for every day of a future sprint.
+burndown_series() {
+  jq -c '
+    def epoch: . + "T00:00:00Z" | fromdateiso8601;
+    def workday: gmtime[6] as $wd | $wd >= 1 and $wd <= 5;   # gmtime weekday: 0 = Sunday
+    def r2: . * 100 | round / 100;
+    .issues as $issues
+    | ([$issues[].hours] | add // 0) as $total
+    | [range(.start | epoch; (.end | epoch) + 1; 86400)] as $days
+    | ([$days[] | select(workday)] | length | if . == 0 then 1 else . end) as $wdays
+    | (if .state == "future" then ""
+       elif .state == "active" and .today < .end then .today
+       else .end end) as $last_actual_day
+    | [{date: "start", label: "start", ideal: $total, actual: $total}]
+      + [foreach $days[] as $t (0; . + ($t | if workday then 1 else 0 end); [$t, .])
+         | . as [$t, $elapsed]
+         | ($t | strftime("%Y-%m-%d")) as $d
+         | {date: $d, label: $d[5:],
+            ideal: ($total * (1 - $elapsed / $wdays) | r2),
+            actual: (if $d > $last_actual_day then null
+                     else $total - ([$issues[] | select(.done_date != "" and .done_date <= $d) | .hours] | add // 0) | r2
+                     end)}]'
+}
+
 cmd_burndown() {
   verify_auth
 
@@ -523,56 +553,12 @@ cmd_burndown() {
   local total_hours
   total_hours=$(echo "$issues" | jq '[.[].hours] | add')
 
-  # The x-axis always spans the full sprint (start to end date), so the end date is visible
-  # even mid-sprint. The "actual" line only has real data through today for an active sprint
-  # (or through the end date once the sprint is closed) - later days get a null actual.
-  local today last_actual_day
+  local today series
   today=$(date +%Y-%m-%d)
-  if [ "$sprint_state" = "future" ]; then
-    last_actual_day=""  # not started: no actual data, only the ideal line
-  elif [ "$sprint_state" = "active" ] && [[ "$today" < "$sprint_end" ]]; then
-    last_actual_day="$today"
-  else
-    last_actual_day="$sprint_end"
-  fi
-
-  local dates=() d
-  d="$sprint_start"
-  while [[ "$d" < "$sprint_end" || "$d" == "$sprint_end" ]]; do
-    dates+=("$d")
-    d=$(date -j -v+1d -f "%Y-%m-%d" "$d" "+%Y-%m-%d")
-  done
-
-  # Total working days (Mon-Fri) across the whole sprint, for the ideal line's slope.
-  local total_wdays=0 wd
-  d="$sprint_start"
-  while [[ "$d" < "$sprint_end" || "$d" == "$sprint_end" ]]; do
-    wd=$(date -j -f "%Y-%m-%d" "$d" "+%u")
-    [ "$wd" -le 5 ] && total_wdays=$((total_wdays + 1))
-    d=$(date -j -v+1d -f "%Y-%m-%d" "$d" "+%Y-%m-%d")
-  done
-  [ "$total_wdays" -eq 0 ] && total_wdays=1
-
-  # Seed with a virtual "start" point at 100% (before day 1's work happens), so each
-  # real date below can show its *end-of-day* value - day 1 then correctly drops from
-  # 100% to ~90% instead of the chart opening already one workday burned down.
-  local series
-  series=$(jq -n --argjson t "$total_hours" '[{date:"start", label:"start", ideal:$t, actual:$t}]')
-
-  local wdays_elapsed=0 ideal actual label
-  for d in "${dates[@]}"; do
-    wd=$(date -j -f "%Y-%m-%d" "$d" "+%u")
-    [ "$wd" -le 5 ] && wdays_elapsed=$((wdays_elapsed + 1))
-    ideal=$(awk -v t="$total_hours" -v e="$wdays_elapsed" -v n="$total_wdays" 'BEGIN{printf "%.2f", t * (1 - e/n)}')
-    label="${d:5}"
-    if [[ "$d" > "$last_actual_day" ]]; then
-      series=$(echo "$series" | jq --arg d "$d" --arg label "$label" --argjson ideal "$ideal" '. + [{date:$d, label:$label, ideal:$ideal, actual:null}]')
-      continue
-    fi
-    actual=$(echo "$issues" | jq --arg d "$d" '[.[] | select(.done_date != "" and .done_date <= $d) | .hours] | add // 0')
-    actual=$(awk -v t="$total_hours" -v a="$actual" 'BEGIN{printf "%.2f", t - a}')
-    series=$(echo "$series" | jq --arg d "$d" --arg label "$label" --argjson ideal "$ideal" --argjson actual "$actual" '. + [{date:$d, label:$label, ideal:$ideal, actual:$actual}]')
-  done
+  series=$(jq -n --argjson issues "$issues" --arg start "$sprint_start" --arg end "$sprint_end" \
+      --arg state "$sprint_state" --arg today "$today" \
+      '{issues: $issues, start: $start, end: $end, state: $state, today: $today}' \
+    | burndown_series)
 
   echo "=== Burndown: $display_name — \"$sprint_name\" ($sprint_start → $sprint_end) ==="
   echo
@@ -624,7 +610,7 @@ PY
   echo
 
   local remaining done_hours
-  remaining=$(echo "$series" | jq -r '[.[] | select(.actual != null)] | last | .actual // 0')
+  remaining=$(echo "$series" | jq -r '[.[] | select(.actual != null)] | last | .actual // 0' | awk '{printf "%.2f", $1}')
   done_hours=$(awk -v t="$total_hours" -v r="$remaining" 'BEGIN{printf "%.2f", t - r}')
   echo "Total estimated: ${total_hours}h   Remaining: ${remaining}h   Done: ${done_hours}h"
 }

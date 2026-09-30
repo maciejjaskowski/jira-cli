@@ -90,6 +90,22 @@ assert_eq "verify_report: empty sprint has 0h (no divide-by-null)" "Sprint \"S10
 assert_eq "verify_report: warns when nothing is In Progress" "⚠ No task is currently In Progress for Test User." \
   "$(echo "$REPORT_INPUT" | jq '.issues |= map(select(.status != "In Progress"))' | verify_report | tail -1)"
 
+# --- burndown series (Mon 2026-09-21 .. Sun 2026-09-27: 5 workdays, 6h total, one 4h issue done on the 22nd)
+series() {  # state today
+  jq -n --arg state "$1" --arg today "$2" '{
+    issues: [{hours: 4, done_date: "2026-09-22"}, {hours: 2, done_date: ""}],
+    start: "2026-09-21", end: "2026-09-27", state: $state, today: $today}' | burndown_series
+}
+fmt() { jq -r 'map("\(.label):\(.ideal)/\(.actual)") | join(" ")'; }
+assert_eq "burndown_series: closed sprint" \
+  "start:6/6 09-21:4.8/6 09-22:3.6/2 09-23:2.4/2 09-24:1.2/2 09-25:0/2 09-26:0/2 09-27:0/2" "$(series closed 2026-10-01 | fmt)"
+assert_eq "burndown_series: active sprint has no actual after today" \
+  "start:6/6 09-21:4.8/6 09-22:3.6/2 09-23:2.4/2 09-24:1.2/null 09-25:0/null 09-26:0/null 09-27:0/null" "$(series active 2026-09-23 | fmt)"
+assert_eq "burndown_series: future sprint has only the ideal line" \
+  "start:6/6 09-21:4.8/null 09-22:3.6/null 09-23:2.4/null 09-24:1.2/null 09-25:0/null 09-26:0/null 09-27:0/null" "$(series future 2026-09-01 | fmt)"
+assert_eq "burndown_series: reopened issue (no done_date) is not burned down" "6" \
+  "$(jq -n '{issues: [{hours: 6, done_date: ""}], start: "2026-09-21", end: "2026-09-22", state: "closed", today: "2026-10-01"}' | burndown_series | jq '.[-1].actual')"
+
 # --- config
 assert_eq "require_config: news needs JIRA_ACCOUNT_ID" "Set JIRA_ACCOUNT_ID (your Atlassian accountId)" \
   "$(unset JIRA_ACCOUNT_ID; (require_config news) 2>&1)"
