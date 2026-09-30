@@ -34,3 +34,6 @@ Set env vars in an untracked file (for example `~/.zshrc.local`).
 
 ## Claude Code skill
 `skill/SKILL.md` is an optional skill that drafts and creates Jira issues. Copy it to `~/.claude/skills/jira/`.
+
+## Tests
+`tests/run.sh` sources `jira` and exercises its modules offline (network functions are stubbed). Needs only `bash` and `jq`.

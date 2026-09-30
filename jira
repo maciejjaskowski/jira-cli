@@ -163,7 +163,7 @@ fetch_issues() {
     resp=$(api_get "${args[@]}")
     lines+=$(echo "$resp" | jq -c '.issues[]')$'\n'
 
-    is_last=$(echo "$resp" | jq -r '.isLast // true')
+    is_last=$(echo "$resp" | jq -r 'if .isLast == false then "false" else "true" end')
     [ "$is_last" = "true" ] && break
     next_token=$(echo "$resp" | jq -r '.nextPageToken // empty')
     [ -z "$next_token" ] && break
@@ -184,7 +184,7 @@ fetch_board_sprints() {
       --data-urlencode "maxResults=$page_size")
     values=$(echo "$resp" | jq -c '.values')
     all=$(jq -c -n --argjson a "$all" --argjson b "$values" '$a + $b')
-    is_last=$(echo "$resp" | jq -r '.isLast // true')
+    is_last=$(echo "$resp" | jq -r 'if .isLast == false then "false" else "true" end')
     [ "$is_last" = "true" ] && break
     start_at=$((start_at + page_size))
   done
