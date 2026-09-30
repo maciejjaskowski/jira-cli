@@ -73,6 +73,15 @@ require_config() {
 # Interactive only when stdin and stdout are terminals (checked here: command substitutions hide stdout).
 IS_TTY=0; [ -t 0 ] && [ -t 1 ] && IS_TTY=1
 
+# Ticket reference. On a terminal: the key as an OSC 8 hyperlink (clickable in iTerm2, Ghostty, WezTerm,
+# kitty; other terminals show the plain key). Piped: a markdown link, so output pastes into Obsidian.
+# Usage: issue_ref KEY
+issue_ref() {
+  local url="${JIRA_BASE_URL%/}/browse/$1"
+  if [ "$IS_TTY" = 1 ]; then printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$1"
+  else printf '[%s](%s)' "$1" "$url"; fi
+}
+
 api_get() {
   local out curl_exit http_code body
   set +e
@@ -303,10 +312,10 @@ cmd_news() {
     indent=$(printf '%*s' $((depth * 2)) '')
     parent_note=""
     if [ "$depth" -eq 0 ] && [ -n "$parent" ]; then
-      parent_note=" _(parent: [$parent]($base/browse/$parent), not in this list)_"
+      parent_note=" _(parent: $(issue_ref "$parent"), not in this list)_"
     fi
-    printf "%s- [%s](%s/browse/%s) — %s | %s | %s | %s | %s%s\n" \
-      "$indent" "$key" "$base" "$key" "$(esc "$status")" "$(esc "$sprint")" "$(esc "$summary")" "$last" "$hours" "$parent_note"
+    printf "%s- %s — %s | %s | %s | %s | %s%s\n" \
+      "$indent" "$(issue_ref "$key")" "$(esc "$status")" "$(esc "$sprint")" "$(esc "$summary")" "$last" "$hours" "$parent_note"
   }
 
   # Recursively print a node and its children (children = rows whose .parent == this key).
@@ -358,7 +367,7 @@ resolve_user_account_id() {
 
 # --- Verify report module -----------------------------------------------------
 # Interface: verify_report < input.json   (prints the report; no API calls)
-# input: {display_name, account_id, project_prefix,
+# input: {display_name, account_id, project_prefix, hyperlinks (OSC 8 links instead of markdown),
 #         issues:   [{key, base, summary, status, estimate_seconds, sprints:[{id,...}]}],
 #         targets:  [sprint],        selected sprints
 #         previous: sprint | null}   sprint before the earliest target
@@ -368,7 +377,10 @@ verify_report() {
   jq -r '
     .issues as $issues | .targets as $targets | .previous as $prev
     | .display_name as $name | .project_prefix as $pp
-    | def link: "- [\(.key)](\(.base)/browse/\(.key)) \u2014 \(.status) | \(.summary)";
+    | (.hyperlinks // false) as $osc
+    | def ref: if $osc then "\u001b]8;;\(.base)/browse/\(.key)\u001b\\\(.key)\u001b]8;;\u001b\\"
+               else "[\(.key)](\(.base)/browse/\(.key))" end;
+      def link: "- \(ref) \u2014 \(.status) | \(.summary)";
       def in_sprint($sid): (.sprints // []) | any(.id == $sid);
       def hours($sid): ([$issues[] | select(in_sprint($sid)) | (.estimate_seconds // 0)] | add // 0) / 3600;
       def section: if length == 0 then "(none)" else join("\n") end;
@@ -437,7 +449,8 @@ cmd_verify() {
 
   jq -n --arg name "$display_name" --arg id "$account_id" --arg pp "${JIRA_PROJECT:+$JIRA_PROJECT-}" \
       --argjson issues "$issues" --argjson targets "$target_sprints" --argjson previous "${prev_sprint:-null}" \
-      '{display_name: $name, account_id: $id, project_prefix: $pp, issues: $issues, targets: $targets, previous: $previous}' \
+      --argjson osc "$([ "$IS_TTY" = 1 ] && echo true || echo false)" \
+      '{display_name: $name, account_id: $id, project_prefix: $pp, hyperlinks: $osc, issues: $issues, targets: $targets, previous: $previous}' \
     | verify_report
 }
 
