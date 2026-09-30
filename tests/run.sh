@@ -79,8 +79,8 @@ EXPECTED='=== jira verify: Test User (acc:1) ===
 
 -- Sprint hour estimates --
 Sprint "S10" (active): 7h estimated
-  - PROJ-1: 2h — Alpha
-  - PROJ-2: 4h — Beta
+  - [PROJ-1](https://x/browse/PROJ-1): 2h — Alpha
+  - [PROJ-2](https://x/browse/PROJ-2): 4h — Beta
 Previous sprint "S9": 4h estimated
 
 OK: 1 task(s) In Progress.'
@@ -90,6 +90,8 @@ assert_eq "verify_report: hyperlinks prints OSC 8 links" "- $OSC — Done | Delt
   "$(echo "$REPORT_INPUT" | jq '.hyperlinks = true' | verify_report | grep 'PROJ-4')"
 assert_eq "issue_ref: markdown when piped" "[PROJ-1](https://x.atlassian.net/browse/PROJ-1)" "$(IS_TTY=0 issue_ref PROJ-1)"
 assert_eq "issue_ref: OSC 8 link on a terminal" $'\033]8;;https://x.atlassian.net/browse/PROJ-1\033\\PROJ-1\033]8;;\033\\' "$(IS_TTY=1 issue_ref PROJ-1)"
+assert_eq "verify_report: hyperlinks also in the estimate list" "  - $(printf '\033]8;;https://x/browse/PROJ-1\033\\PROJ-1\033]8;;\033\\'): 2h — Alpha" \
+  "$(echo "$REPORT_INPUT" | jq '.hyperlinks = true' | verify_report | grep ': 2h')"
 assert_eq "verify_report: empty sprint has 0h (no divide-by-null)" "Sprint \"S10\" (active): 0h estimated" \
   "$(echo "$REPORT_INPUT" | jq '.issues = []' | verify_report | grep '^Sprint ')"
 assert_eq "verify_report: warns when nothing is In Progress" "⚠ No task is currently In Progress for Test User." \

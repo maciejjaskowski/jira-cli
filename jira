@@ -81,6 +81,12 @@ issue_ref() {
   if [ "$IS_TTY" = 1 ]; then printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$1"
   else printf '[%s](%s)' "$1" "$url"; fi
 }
+# The same formatting for jq programs: KEY | issue_ref($osc; $base). Prepend to a program: jq "$JQ_ISSUE_REF"'...'
+JQ_ISSUE_REF='def issue_ref($osc; $base): . as $k
+  | if $osc then "\u001b]8;;\($base)/browse/\($k)\u001b\\\($k)\u001b]8;;\u001b\\"
+    else "[\($k)](\($base)/browse/\($k))" end;
+'
+IS_TTY_JSON=$([ "$IS_TTY" = 1 ] && echo true || echo false)
 
 api_get() {
   local out curl_exit http_code body
@@ -374,12 +380,11 @@ resolve_user_account_id() {
 # Sprint identity comes from the board (targets/previous), not from whichever sprints happen
 # to be attached to this user's own issues.
 verify_report() {
-  jq -r '
+  jq -r "$JQ_ISSUE_REF"'
     .issues as $issues | .targets as $targets | .previous as $prev
     | .display_name as $name | .project_prefix as $pp
     | (.hyperlinks // false) as $osc
-    | def ref: if $osc then "\u001b]8;;\(.base)/browse/\(.key)\u001b\\\(.key)\u001b]8;;\u001b\\"
-               else "[\(.key)](\(.base)/browse/\(.key))" end;
+    | def ref: .base as $b | .key | issue_ref($osc; $b);
       def link: "- \(ref) \u2014 \(.status) | \(.summary)";
       def in_sprint($sid): (.sprints // []) | any(.id == $sid);
       def hours($sid): ([$issues[] | select(in_sprint($sid)) | (.estimate_seconds // 0)] | add // 0) / 3600;
@@ -399,7 +404,7 @@ verify_report() {
      else $targets[] | . as $s
        | "Sprint \"\($s.name)\" (\($s.state)): \(hours($s.id))h estimated",
          ([$issues[] | select(in_sprint($s.id)) | select(.key | startswith($pp)) | select(.estimate_seconds != null)]
-          | sort_by(.key) | .[] | "  - \(.key): \(.estimate_seconds / 3600)h \u2014 \(.summary)")
+          | sort_by(.key) | .[] | "  - \(ref): \(.estimate_seconds / 3600)h \u2014 \(.summary)")
      end),
     (if $prev == null then "Previous sprint: none found."
      else "Previous sprint \"\($prev.name)\": \(hours($prev.id))h estimated" end),
@@ -449,7 +454,7 @@ cmd_verify() {
 
   jq -n --arg name "$display_name" --arg id "$account_id" --arg pp "${JIRA_PROJECT:+$JIRA_PROJECT-}" \
       --argjson issues "$issues" --argjson targets "$target_sprints" --argjson previous "${prev_sprint:-null}" \
-      --argjson osc "$([ "$IS_TTY" = 1 ] && echo true || echo false)" \
+      --argjson osc "$IS_TTY_JSON" \
       '{display_name: $name, account_id: $id, project_prefix: $pp, hyperlinks: $osc, issues: $issues, targets: $targets, previous: $previous}' \
     | verify_report
 }
@@ -616,9 +621,9 @@ PY
   echo
 
   echo "-- Issues --"
-  echo "$issues" | jq -r '
+  echo "$issues" | jq -r --argjson osc "$IS_TTY_JSON" --arg base "$JIRA_BASE_URL" "$JQ_ISSUE_REF"'
     sort_by(.key)
-    | .[] | "- \(.key): \(.hours)h — \(.status)\(if .done_date != "" then " (done \(.done_date))" else "" end) — \(.summary)"
+    | .[] | "- \(.key | issue_ref($osc; $base)): \(.hours)h — \(.status)\(if .done_date != "" then " (done \(.done_date))" else "" end) — \(.summary)"
   '
   echo
 
@@ -693,7 +698,7 @@ cmd_update() {
 
   verify_auth
   api_post "$API/issue/$task_id/transitions" "{\"transition\":{\"id\":\"$transition_id\"}}" >/dev/null
-  echo "$task_id -> $status (transition $transition_id)"
+  echo "$(issue_ref "$task_id") -> $status (transition $transition_id)"
 }
 
 usage() {
